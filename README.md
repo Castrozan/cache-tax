@@ -7,6 +7,8 @@
 
 **Keep Claude Code's prompt cache warm during breaks.**
 
+> This fork draws no row above the prompt. Keepwarm and the cold-send guard are unchanged; `/keepwarm status` and `/cache-tax` show the state.
+
 Cache Tax is a Claude Code mod that refreshes your prompt cache while you step away and shows the estimated rewrite cost before a cold send. Run `/keepwarm 90m` before a break. Pings cost tokens; choose a window you expect to return within.
 
 **[Install](#install)** · [Website](https://cachetax.aidojo.si/) · [How it works](#how-it-works) · [Costs and limits](#cost-and-the-plan-limit-question) · [Commands](#commands)
