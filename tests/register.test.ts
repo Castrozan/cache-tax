@@ -34,7 +34,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; storeGate?: (op: 'get' | 'set' | 'delete', key: string) => Promise<void> } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; storeGate?: (op: 'get' | 'set' | 'delete', key: string) => Promise<void>; forkReplaysLastFinishedTurnAt?: () => number } = {}) {
   if (opts.store) {
     const store = opts.store
     // A read takes its value first and is delivered after the gate, as a reply can arrive late.
@@ -51,6 +51,12 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   })
   on('config.set', ($, e) => opts.denyTheme ? { deny: 'theme locked' } : { value: opts.writtenTheme ?? e.value })
   const forks: number[] = []
+  const replayOfFinishedTurns = (): ForkAnswer => {
+    const now = opts.forkReplaysLastFinishedTurnAt?.() ?? 0
+    if (!finishedTurnsAreCached(now)) return lapsedFinishedTurns
+    finishedTurnsReadAt = now
+    return warm
+  }
   const status: Array<string | undefined> = []
   const logs: string[] = []
   const entered: string[] = []
@@ -60,9 +66,25 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: opts.live?.tokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('command.list', () => ({ value: (opts.commands ?? []).map(name => ({ name, description: '', source: 'plugin' as const })) }))
-  on('turn.complete', ($, e) => ({ text: e.answer }))
+  let requestsSinceFinishedTurn = 0
+  let finishedTurnsReadAt = 0
+  const finishedTurnsAreCached = (now: number) => finishedTurnsReadAt > 0 && now - finishedTurnsReadAt < HOUR
+  on('turn.complete', ($, e) => {
+    if (e.agentId === undefined && !e.isAborted && e.reason === 'answer') {
+      requestsSinceFinishedTurn = 0
+      finishedTurnsReadAt = opts.forkReplaysLastFinishedTurnAt?.() ?? 0
+    }
+    return { text: e.answer }
+  })
   on('turn.step', async function* ($, e) {
     const u = opts.steps?.shift() ?? null
+    if (e.agentId === undefined && opts.forkReplaysLastFinishedTurnAt) {
+      const now = opts.forkReplaysLastFinishedTurnAt()
+      const answeredFromCache = u !== null && u.cache_read_input_tokens > u.cache_creation_input_tokens
+      if (requestsSinceFinishedTurn === 0 && !finishedTurnsAreCached(now)) finishedTurnsReadAt = 0
+      else if (requestsSinceFinishedTurn === 0 && answeredFromCache) finishedTurnsReadAt = now
+      requestsSinceFinishedTurn++
+    }
     yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: u }
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: u }
   })
@@ -75,7 +97,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('model.fork', async () => {
     forks.push(forks.length)
     if (opts.gate) await opts.gate()
-    const a = forkAnswers.shift()
+    const a = requestsSinceFinishedTurn > 0 && forkAnswers.length === 0 ? replayOfFinishedTurns() : forkAnswers.shift()
     // Older Claude Code releases returned null instead of a failure object.
     if (a === null || a === undefined) return { value: null as unknown as ModelForkResult }
     if ('isAnswered' in a) return { value: a }
@@ -86,6 +108,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
+const lapsedFinishedTurns: ForkAnswer = { read: 18517, write: 154503 }
 // A ping that finds nothing to fork leaves the window waiting, with a wake at the cold mark and no further fork.
 const nothing: ForkAnswer = { isAnswered: false, reason: 'nothing-to-fork' }
 const busy: ForkAnswer = { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() }
@@ -1578,7 +1601,7 @@ describe('the shared always switch across a turn', () => {
     await finishing
     await settle()
     expect(store.has('deadline:S1')).toBe(false)
-    expect(w.logs.at(-1)).toBe('cold write of 200k tokens paid ($4.00).')
+    expect(w.logs.at(-1)).toBe('cold write of 200k tokens paid ($4.00). Keepwarm was turned off during this turn, so the cache goes cold in 1h00m.')
     await clock.advance(2 * HOUR)
     expect(w.forks.length).toBe(before)
   })
@@ -1614,7 +1637,7 @@ describe('/keepwarm off while a turn is running', () => {
     await $.command.run(run('keepwarm', 'off'))
     await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
     expect(store.has('deadline:S1')).toBe(false)
-    expect(w.logs.at(-1)).toBe('cold write of 200k tokens paid ($4.00).')
+    expect(w.logs.at(-1)).toBe('cold write of 200k tokens paid ($4.00). Keepwarm was turned off during this turn, so the cache goes cold in 1h00m.')
     await clock.advance(2 * HOUR)
     expect(w.forks.length).toBe(0)
   })
@@ -1631,5 +1654,283 @@ describe('/keepwarm off while a turn is running', () => {
     for await (const c of $.turn.step({ turnId: 'comeback', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
     await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
     expect(store.get('deadline:S1')).toBe(START + 2 * HOUR + 3 * HOUR)
+  })
+})
+
+describe('after an interrupted turn', () => {
+  type Driver = Parameters<TestBody>[0]
+  const request = async ($: Driver, turnId: string, index = 0) => {
+    for await (const c of $.turn.step({ turnId, index, model: 'claude-fable-5-1', messageCount: 3 })) void c
+  }
+  const interrupted = (turnId: string, over: Partial<TurnUsage> = {}) => turn({ turnId, isAborted: true, reason: 'aborted', answer: '', usage: usage(over) })
+  const coldWrite = { cache_read_input_tokens: 0, cache_creation_input_tokens: 200502 }
+
+  test('an interrupted cold write sends no ping, since a fork would replay and re-write only the turns before it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('hi'))
+    await $.prompt.submit(prompt('hi'))
+    await request($, 'paid')
+    await $.turn.complete(interrupted('paid', coldWrite))
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(0)
+    await clock.advance(3 * HOUR)
+    expect(w.forks.length).toBe(0)
+    expect(w.logs.filter(line => line.includes('stopped'))).toEqual([])
+  })
+
+  test('its receipt says the cache goes cold in an hour, and what would hold it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('hi'))
+    await $.prompt.submit(prompt('hi'))
+    await request($, 'paid')
+    await $.turn.complete(interrupted('paid', coldWrite))
+    expect(w.logs.at(-1)).toBe('cold write of 201k tokens paid ($4.01). This turn was interrupted, so keepwarm cannot hold its cache: it goes cold in 1h00m. Finish a turn before then and keepwarm holds it for the rest of 3h00m; /keepwarm off to stop.')
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm 3h00m left · last turn interrupted, nothing to hold until a turn finishes')
+    expect((await $.command.run(run('keepwarm', '2h'))).text).toBe('keepwarm on for 2h00m. The last turn was interrupted, so there is nothing to hold until a turn finishes')
+  })
+
+  test('a turn that finishes within that hour is held past it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('hi'))
+    await $.prompt.submit(prompt('hi'))
+    await request($, 'paid')
+    await $.turn.complete(interrupted('paid', coldWrite))
+    await clock.advance(20 * MIN)
+    await request($, 'finished')
+    await $.turn.complete(turn({ turnId: 'finished' }))
+    expect(w.status.at(-1)).toBe('keepwarm 2h40m left · ping in 50m')
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(15 * MIN)
+    expect((await $.prompt.submit(prompt('back'))).drop).toBe(undefined)
+  })
+
+  test('an interrupted turn in a warm session keeps the turns before it warm, on the clock of their own last read', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now, steps: [usage(), usage()] })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await request($, 'cut', 0)
+    await clock.advance(15 * MIN)
+    await request($, 'cut', 1)
+    await $.turn.complete(interrupted('cut'))
+    expect(w.status.at(-1)).toBe('keepwarm 2h35m left · ping in 35m, holding only the turns before the interrupted one')
+    await clock.advance(35 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/ping in 50m, holding only the turns before the interrupted one · last ping read 200k/)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.logs).toEqual([])
+    expect((await $.prompt.submit(prompt('back'))).drop).toMatch(/the prompt cache went cold 25m ago/)
+  })
+
+  test('a turn that finishes brings the whole conversation back under the pings', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await clock.advance(10 * MIN)
+    await request($, 'finished')
+    await $.turn.complete(turn({ turnId: 'finished' }))
+    expect(w.status.at(-1)).toBe('keepwarm 2h50m left · ping in 50m')
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(55 * MIN)
+    expect((await $.prompt.submit(prompt('back'))).drop).toBe(undefined)
+  })
+
+  test('a first request that was never answered leaves the turns before it on their earlier read', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await clock.advance(30 * MIN)
+    await request($, 'cut')
+    await $.turn.complete(turn({ turnId: 'cut', isAborted: true, reason: 'aborted', answer: '', usage: undefined }))
+    expect(w.status.at(-1)).toBe('keepwarm 2h30m left · ping in 20m, holding only the turns before the interrupted one')
+    await clock.advance(20 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.logs).toEqual([])
+  })
+
+  test('a turn running when the ping comes due costs one ping, not one for each of its requests', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now, steps: [usage()], gate: () => new Promise<void>(r => { release = r }) })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await clock.advance(48 * MIN)
+    await request($, 'running', 0)
+    await clock.advance(2 * MIN)
+    expect(w.forks.length).toBe(1)
+    await request($, 'running', 1)
+    release()
+    await clock.settle()
+    expect(w.status.at(-1)).toMatch(/ping in 50m, holding only the turns before the interrupted one · last ping read 200k/)
+    await clock.advance(MIN)
+    await request($, 'running', 2)
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('a second interrupted turn in a row leaves the earlier turns on their clock', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now, steps: [usage(), usage()] })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await clock.advance(10 * MIN)
+    await request($, 'cut again')
+    await $.turn.complete(interrupted('cut again'))
+    expect(w.status.at(-1)).toBe('keepwarm 2h40m left · ping in 40m, holding only the turns before the interrupted one')
+    await clock.advance(40 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.logs).toEqual([])
+  })
+
+  test('a turn that ends on an API error is not taken for an interrupt, and does not end one either', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await request($, 'failed')
+    await $.turn.complete(turn({ turnId: 'failed', reason: 'error', answer: '' }))
+    expect(w.status.at(-1)).toBe('keepwarm 3h00m left · ping in 50m')
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await request($, 'failed again')
+    await $.turn.complete(turn({ turnId: 'failed again', reason: 'error', answer: '' }))
+    expect(w.status.at(-1)).toBe('keepwarm 3h00m left · ping in 50m, holding only the turns before the interrupted one')
+  })
+
+  test('a busy API is retried on the clock of the turns the ping holds', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [busy], { forkReplaysLastFinishedTurnAt: clock.now, steps: [usage()] })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await clock.advance(50 * MIN)
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m, holding only the turns before the interrupted one · last ping read 200k/)
+  })
+
+  test('/keepwarm always says what the pings hold after an interrupt', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { store: new Map<string, unknown>(), forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    expect((await $.command.run(run('keepwarm', 'always'))).text).toBe('keepwarm always on: every session stays warm until 6h00m after its last turn; /keepwarm off turns it off for good. The last turn was interrupted, so the pings hold only the turns before it until a turn finishes')
+  })
+
+  test('a resumed conversation starts without the interrupted turn of the one before it', async ($, on) => {
+    mock.clock(on, { now: START })
+    const w = world(on, [], { store: new Map<string, unknown>() })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 10 * 60, context_tokens: 200000 })
+    expect(w.status.at(-1)).toBe('keepwarm 3h00m left · ping in 40m')
+  })
+
+  test('a compaction leaves nothing of the turns before an interrupted one to hold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut'))
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
+    await request($, 'cut again')
+    await $.turn.complete(interrupted('cut again'))
+    expect(w.status.at(-1)).toBe('keepwarm 3h00m left · last turn interrupted, nothing to hold until a turn finishes')
+    await clock.advance(3 * HOUR)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('the receipt of an interrupted turn that wrote much onto a warm session says only the turns before it are held', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { forkReplaysLastFinishedTurnAt: clock.now })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await request($, 'cut')
+    await $.turn.complete(interrupted('cut', { cache_creation_input_tokens: 150000 }))
+    expect(w.logs.at(-1)).toBe("cold write of 150k tokens paid ($3.00). This turn was interrupted, so keepwarm holds only the turns before it for 3h00m: this turn's own part goes cold in 1h00m unless a turn finishes first; /keepwarm off to stop.")
+  })
+})
+
+describe('what the transcript is told', () => {
+  test('a window that stops says so, with the reason', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [{ read: 0, write: 180000 }])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '6h'))
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.logs.at(-1)).toBe('keepwarm stopped: the ping read 0 and wrote 180k tokens ($3.60), the cache was already gone. The cache is no longer held; /keepwarm starts it again.')
+  })
+
+  test('a window armed again after an off during the turn is not called off in the receipt', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('hi'))
+    await $.prompt.submit(prompt('hi'))
+    for await (const c of $.turn.step({ turnId: 'comeback', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
+    await $.command.run(run('keepwarm', 'off'))
+    await $.command.run(run('keepwarm', '2h'))
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+    expect(w.logs.at(-1)).toBe('cold write of 200k tokens paid ($4.00).')
+    expect(w.status.at(-1)).toBe('keepwarm 2h00m left · ping in 50m')
+  })
+
+  test('a window that ends on time or by /keepwarm off adds no line', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '1h'))
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.command.run(run('keepwarm', '1h'))
+    await $.command.run(run('keepwarm', 'off'))
+    expect(w.logs).toEqual([])
   })
 })

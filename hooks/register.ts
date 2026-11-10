@@ -76,6 +76,8 @@ export type State = {
   turnOffs: number | null
   inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
+  forkIsBehind: boolean
+  forkTouchedAt: number
 }
 
 function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
@@ -137,6 +139,14 @@ function isCold(s: State, now: number): boolean {
   return s.lastRequestAt > 0 && !s.compacted && now - s.lastRequestAt >= TTL_MS
 }
 
+function replayedSince(s: State): number {
+  return s.forkIsBehind ? s.forkTouchedAt : s.lastRequestAt
+}
+
+function isReplayCold(s: State, now: number): boolean {
+  return s.forkIsBehind ? s.forkTouchedAt === 0 || now - s.forkTouchedAt >= TTL_MS : isCold(s, now)
+}
+
 function guardText(s: State, now: number): string {
   const price = priceOf(s.lastModel, s.ctx)
   const rate = price ? `$${price[1]}/MTok` : 'the cache-write rate'
@@ -165,6 +175,8 @@ export function resetForClear(s: State) {
   s.misses = []
   s.waitForTurn = false
   s.stepWrites = null
+  s.forkIsBehind = false
+  s.forkTouchedAt = 0
   outdate(s)
   disarm(s)
 }
@@ -176,6 +188,8 @@ export function seedFromResume(s: State, e: ResumeFields, now: number): string |
   if (typeof e.seconds_since_last_response === 'number') s.lastRequestAt = now - e.seconds_since_last_response * 1000
   if (typeof e.model === 'string') s.lastModel = e.model
   s.compacted = false
+  s.forkIsBehind = false
+  s.forkTouchedAt = 0
   if (e.prompt_cache_likely_expired !== true || s.ctx < BIG_TOKENS) return null
   const usd = typeof e.estimated_cache_write_usd === 'number' ? fmtUsd(e.estimated_cache_write_usd) : fmtUsd(coldUsd(s))
   return `resuming cold. The first message re-writes ${s.ctx.toLocaleString('en-US')} tokens, about ${usd}. /clear and paste a summary if you only need the conclusions.`
@@ -187,10 +201,10 @@ function statusText(s: State, now: number): string | undefined {
   const pingText = s.last ? ` · last ping read ${fmtTok(s.last.read)} ${fmtUsd(s.last.usd)}` : ''
   const nextText = !s.lastRequestAt ? ' · waiting for the first turn'
     : s.compacted ? ' · waiting for the first turn after compaction'
-    : isCold(s, now) ? ` · cold now, first ping ${fmtDuration(s.every)} after the next turn`
+    : isReplayCold(s, now) ? (s.forkIsBehind ? ' · last turn interrupted, nothing to hold until a turn finishes' : ` · cold now, first ping ${fmtDuration(s.every)} after the next turn`)
     : s.waitForTurn ? ' · nothing to fork yet, first ping after the next turn'
     : s.retries ? ` · API busy, ping retry ${s.retries} of ${MAX_RETRIES}`
-    : ` · ping in ${fmtDuration(s.lastRequestAt + s.every - now)}`
+    : ` · ping in ${fmtDuration(replayedSince(s) + s.every - now)}${s.forkIsBehind ? ', holding only the turns before the interrupted one' : ''}`
   return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
 }
 
@@ -248,6 +262,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
   if (forgetAlways) await $.store.delete(KEY_ALWAYS)
+  if (why) $.ui.log(`keepwarm stopped: ${why}. The cache is no longer held; /keepwarm starts it again.`)
   updateStatus($, s, await $.clock.now())
 }
 
@@ -262,12 +277,13 @@ async function arm($: EngineInterface, s: State) {
   s.retries = 0
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
-  if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
-    const untilCold = s.lastRequestAt + TTL_MS - now
+  const since = replayedSince(s)
+  if (since && !s.compacted && !isReplayCold(s, now)) {
+    const untilCold = since + TTL_MS - now
     // Waiting for a turn sends nothing, but wakes when the cache goes cold so the row says so.
     if (s.waitForTurn) s.pending = $.clock.after(Math.min(s.deadline - now, untilCold), () => { void arm($, s) })
     else {
-      const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
+      const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, since + s.every - now))
       s.pending = $.clock.after(delay, () => { void ping($, s) })
     }
   } else {
@@ -288,21 +304,22 @@ async function ping($: EngineInterface, s: State) {
   // below with no await in between, so two timers can never both send.
   if (s.inFlight) return
   if (now >= s.deadline) return arm($, s)
-  if (isCold(s, now)) return arm($, s)
+  if (isReplayCold(s, now)) return arm($, s)
   if (s.compacted || s.waitForTurn || !s.lastRequestAt) return arm($, s)
   // A request since this timer was set moved the clock; schedule from it.
-  if (now - s.lastRequestAt < s.every - 1000) return arm($, s)
+  if (now - replayedSince(s) < s.every - 1000) return arm($, s)
   // A host that slept past a retry's slot must not send it inside the last minute.
-  if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
+  if (s.retries && now >= replayedSince(s) + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
   const gen = s.gen
-  const sentAt = s.lastRequestAt
+  const sentBehind = s.forkIsBehind
+  const sentSince = replayedSince(s)
   s.inFlight = true
   const sent = await $.model.fork({ prompt: PING_PROMPT }).then(reply => ({ reply }), (err: unknown) => ({ err }))
   const at = await $.clock.now()
   s.inFlight = false
   // Checked after the last await. A stop, /clear, resume or compaction, or a main request that moved the
   // cache clock, replaced what this fork was sent for: its reply is dropped and the window armed afresh.
-  if (gen !== s.gen || s.lastRequestAt !== sentAt) return s.pending ? undefined : arm($, s)
+  if (gen !== s.gen || s.forkIsBehind !== sentBehind || replayedSince(s) !== sentSince) return s.pending ? undefined : arm($, s)
   if ('err' in sent) return stop($, s, `the ping failed, ${sent.err instanceof Error ? sent.err.message : String(sent.err)}`)
   const reply = sent.reply
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
@@ -318,7 +335,7 @@ async function ping($: EngineInterface, s: State) {
     // A busy or failing API is usually brief; retry while a ping can still land a minute before the cache goes cold.
     if (reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)) {
       const wait = MIN_PING_MS * 2 ** s.retries
-      if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
+      if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, replayedSince(s) + TTL_MS - MIN_PING_MS)) {
         s.retries++
         s.retryReason = reason
         // Replaces any timer set while the fork was out, such as a window extension's, so only the retry fires.
@@ -337,7 +354,8 @@ async function ping($: EngineInterface, s: State) {
   const usd = price ? pingUsd(u, price) : null
   s.last = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, warm }
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
-  s.lastRequestAt = now
+  if (s.forkIsBehind) s.forkTouchedAt = now
+  else s.lastRequestAt = now
   await arm($, s)
 }
 
@@ -351,7 +369,24 @@ function holdMs(s: State): number {
   return s.always ? DEFAULT_WINDOW_MS : AUTO_WARM_MS
 }
 
+function holdAfterColdWrite(s: State, now: number, isExtended: boolean, wasTurnedOffDuringTurn: boolean): string {
+  const untilCold = fmtDuration(s.lastRequestAt + TTL_MS - now)
+  if (wasTurnedOffDuringTurn && !s.deadline) return ` Keepwarm was turned off during this turn, so the cache goes cold in ${untilCold}.`
+  if (s.forkIsBehind && s.deadline > now) {
+    const window = fmtDuration(s.deadline - now)
+    return isReplayCold(s, now)
+      ? ` This turn was interrupted, so keepwarm cannot hold its cache: it goes cold in ${untilCold}. Finish a turn before then and keepwarm holds it for the rest of ${window}; /keepwarm off to stop.`
+      : ` This turn was interrupted, so keepwarm holds only the turns before it for ${window}: this turn's own part goes cold in ${untilCold} unless a turn finishes first; /keepwarm off to stop.`
+  }
+  return isExtended ? ` Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.` : ''
+}
+
+function holdAfterInterrupt(s: State, now: number): string {
+  return `The last turn was interrupted, so ${isReplayCold(s, now) ? 'there is nothing to hold until a turn finishes' : 'the pings hold only the turns before it until a turn finishes'}`
+}
+
 function armedText(s: State, now: number, windowMs: number): string {
+  if (s.forkIsBehind) return `keepwarm on for ${fmtDuration(windowMs)}. ${holdAfterInterrupt(s, now)}`
   if (isCold(s, now)) return `keepwarm on for ${fmtDuration(windowMs)}. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn`
   return `keepwarm on for ${fmtDuration(windowMs)}, a ping ${fmtDuration(s.every)} after each idle stretch keeps the cache read, not re-written`
 }
@@ -405,6 +440,7 @@ export function freshState(): State {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
     waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null,
+    forkIsBehind: false, forkTouchedAt: 0,
   }
 }
 
@@ -504,7 +540,8 @@ export const register: Register = on => {
       s.always = true
       await $.store.set(KEY_ALWAYS, true)
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
-      const cold = isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
+      const cold = s.forkIsBehind ? `. ${holdAfterInterrupt(s, now)}`
+        : isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
       return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn; /keepwarm off turns it off for good${cold}` }
     }
     if (!words.length) {
@@ -564,14 +601,19 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    const opensTurnOnFinishedTurns = !e.agentId && e.index === 0 && !s.forkIsBehind
+    let requestedAt = 0
     if (!e.agentId) {
       // The off count when the turn's first request went out: an off after it wins over what the turn opens.
       if (e.index === 0) s.turnOffs = s.offs
-      s.lastRequestAt = await $.clock.now()
+      requestedAt = await $.clock.now()
+      if (opensTurnOnFinishedTurns) s.forkTouchedAt = !s.lastRequestAt || s.compacted || isCold(s, requestedAt) ? 0 : s.lastRequestAt
+      s.lastRequestAt = requestedAt
     }
     const r = yield* next(e)
     // Each request's write is priced at its own prompt length's tier (Haiku 5.5 changes price at 100k), not the turn's sum.
     const u = r.usage
+    if (opensTurnOnFinishedTurns && s.forkTouchedAt && u && u.cache_read_input_tokens > u.cache_creation_input_tokens) s.forkTouchedAt = requestedAt
     if (!e.agentId && u) {
       const price = priceOf(u.model || e.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
       const was = s.stepWrites ?? { usd: 0, priced: true }
@@ -586,7 +628,13 @@ export const register: Register = on => {
     // An off at any point in this turn wins over every window the turn would open; a host that raised no
     // step falls back to the count at completion.
     const offs = s.turnOffs ?? s.offs
+    const sentRequest = s.turnOffs !== null || Boolean(e.usage)
     s.turnOffs = null
+    if (e.isAborted) s.forkIsBehind = s.forkIsBehind || sentRequest
+    else if (e.reason === 'answer') {
+      s.forkIsBehind = false
+      s.forkTouchedAt = 0
+    }
     const now = await $.clock.now()
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
@@ -621,10 +669,10 @@ export const register: Register = on => {
         const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
-        const extend = s.deadline < now + AUTO_WARM_MS && s.offs === offs
+        const wasTurnedOffDuringTurn = s.offs !== offs
+        const extend = !wasTurnedOffDuringTurn && s.deadline < now + AUTO_WARM_MS
         if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
-        $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` +
-          (extend ? ` Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.` : ''))
+        $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` + holdAfterColdWrite(s, now, extend, wasTurnedOffDuringTurn))
       }
     }
     s.coldWritePending = false
@@ -639,6 +687,7 @@ export const register: Register = on => {
       s.compacted = true
       s.ctx = 0
       s.ackedAt = 0
+      s.forkTouchedAt = 0
       outdate(s)
       disarm(s)
       await arm($, s)
