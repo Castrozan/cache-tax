@@ -381,6 +381,13 @@ function holdAfterColdWrite(s: State, now: number, isExtended: boolean, wasTurne
   return isExtended ? ` Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.` : ''
 }
 
+async function holdOpenedAfterColdWrite($: EngineInterface, s: State, now: number, offs: number): Promise<string> {
+  const wasTurnedOffDuringTurn = s.offs !== offs
+  const extend = !wasTurnedOffDuringTurn && s.deadline < now + AUTO_WARM_MS
+  if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
+  return holdAfterColdWrite(s, now, extend, wasTurnedOffDuringTurn)
+}
+
 function holdAfterInterrupt(s: State, now: number): string {
   return `The last turn was interrupted, so ${isReplayCold(s, now) ? 'there is nothing to hold until a turn finishes' : 'the pings hold only the turns before it until a turn finishes'}`
 }
@@ -669,11 +676,10 @@ export const register: Register = on => {
         const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
-        const wasTurnedOffDuringTurn = s.offs !== offs
-        const extend = !wasTurnedOffDuringTurn && s.deadline < now + AUTO_WARM_MS
-        if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
-        $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` + holdAfterColdWrite(s, now, extend, wasTurnedOffDuringTurn))
+        $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` + await holdOpenedAfterColdWrite($, s, now, offs))
       }
+    } else if (s.coldWritePending && e.isAborted && sentRequest) {
+      $.ui.log('cold write sent, size not reported.' + await holdOpenedAfterColdWrite($, s, now, offs))
     }
     s.coldWritePending = false
     s.stepWrites = null
