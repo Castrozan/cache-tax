@@ -10,13 +10,7 @@ const BIG_TOKENS = 50000
 const PING_PROMPT = 'Reply with the single word: warm'
 const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
-const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
-
-// Prompts no person sent, so nobody could send them again after a refusal. Every
-// other origin, including sdk, unclassified and the owner's own Slack or channel
-// messages, may carry a person's words and keeps the guard.
-const UNATTENDED = new Set(['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity'])
 
 const LONG_PROMPT_TOKENS = 100000
 
@@ -48,7 +42,6 @@ const LONG_PRICES: Array<[string, number, number, number]> = [
 
 type PingRecord = { at: number; read: number; write: number; usd: number | null; warm: boolean }
 type Miss = { at: number; tokens: number; usd: number | null }
-type GuardMode = 'refuse' | 'warn'
 
 export type State = {
   hasBand: boolean
@@ -60,8 +53,6 @@ export type State = {
   lastModel: string | null
   ctx: number
   compacted: boolean
-  guard: GuardMode
-  ackedAt: number
   coldWritePending: boolean
   misses: Miss[]
   pending: { cancel: () => void } | null
@@ -147,22 +138,11 @@ function isReplayCold(s: State, now: number): boolean {
   return s.forkIsBehind ? s.forkTouchedAt === 0 || now - s.forkTouchedAt >= TTL_MS : isCold(s, now)
 }
 
-function guardText(s: State, now: number): string {
-  const price = priceOf(s.lastModel, s.ctx)
-  const rate = price ? `$${price[1]}/MTok` : 'the cache-write rate'
-  const warm = warmUsd(s)
-  return `the prompt cache went cold ${fmtDuration(now - s.lastRequestAt - TTL_MS)} ago. Sending this re-writes ` +
-    `up to ${s.ctx.toLocaleString('en-US')} tokens at ${rate} = ${fmtUsd(coldUsd(s))}` +
-    (warm == null ? '' : ` (a warm turn would have cost ${fmtUsd(warm)})`) + '.'
-}
-
 export type ResumeFields = {
   source: string
   model?: string
   context_tokens?: number
   seconds_since_last_response?: number
-  prompt_cache_likely_expired?: boolean
-  estimated_cache_write_usd?: number
 }
 
 /** /clear starts a new conversation in the same process; nothing priced before it still exists. */
@@ -170,7 +150,6 @@ export function resetForClear(s: State) {
   s.ctx = 0
   s.lastRequestAt = 0
   s.compacted = false
-  s.ackedAt = 0
   s.coldWritePending = false
   s.misses = []
   s.waitForTurn = false
@@ -181,18 +160,15 @@ export function resetForClear(s: State) {
   disarm(s)
 }
 
-/** Applies a resumed session's fields to the state; returns the line to log, if any. */
-export function seedFromResume(s: State, e: ResumeFields, now: number): string | null {
-  if (e.source !== 'resume' && e.source !== 'fork') return null
+/** Applies a resumed session's fields to the state. */
+function seedFromResume(s: State, e: ResumeFields, now: number) {
+  if (e.source !== 'resume' && e.source !== 'fork') return
   if (typeof e.context_tokens === 'number' && e.context_tokens > 0) s.ctx = e.context_tokens
   if (typeof e.seconds_since_last_response === 'number') s.lastRequestAt = now - e.seconds_since_last_response * 1000
   if (typeof e.model === 'string') s.lastModel = e.model
   s.compacted = false
   s.forkIsBehind = false
   s.forkTouchedAt = 0
-  if (e.prompt_cache_likely_expired !== true || s.ctx < BIG_TOKENS) return null
-  const usd = typeof e.estimated_cache_write_usd === 'number' ? fmtUsd(e.estimated_cache_write_usd) : fmtUsd(coldUsd(s))
-  return `resuming cold. The first message re-writes ${s.ctx.toLocaleString('en-US')} tokens, about ${usd}. /clear and paste a summary if you only need the conclusions.`
 }
 
 function statusText(s: State, now: number): string | undefined {
@@ -227,7 +203,7 @@ function outdate(s: State) {
 
 // The window and its ping period belong to the session that armed them, so a
 // second session, or one resumed from another transcript, never inherits them
-// and cannot turn them off. The always switch and the guard mode stay global.
+// and cannot turn them off. The always switch stays global.
 function deadlineKey(s: State): string {
   return `${KEY_DEADLINE}:${s.sid}`
 }
@@ -363,12 +339,6 @@ function afterRetries(n: number): string {
   return n ? ` after ${n} ${n === 1 ? 'retry' : 'retries'}` : ''
 }
 
-/** The reply to an arming command; on a cold cache it says when the first ping can come. */
-/** How long keepwarm holds the cache after a paid cold write: the rolling window when always is on. */
-function holdMs(s: State): number {
-  return s.always ? DEFAULT_WINDOW_MS : AUTO_WARM_MS
-}
-
 function holdAfterColdWrite(s: State, now: number, isExtended: boolean, wasTurnedOffDuringTurn: boolean): string {
   const untilCold = fmtDuration(s.lastRequestAt + TTL_MS - now)
   if (wasTurnedOffDuringTurn && !s.deadline) return ` Keepwarm was turned off during this turn, so the cache goes cold in ${untilCold}.`
@@ -436,7 +406,6 @@ function card(s: State, now: number): string {
   lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
-  lines.push(`guard       ${s.guard === 'refuse' ? 'refuse once (/cache-tax guard warn to only show the price)' : 'warn only (/cache-tax guard refuse to be stopped once)'}`)
   const paid = s.misses.reduce((a, m) => a + (m.usd ?? 0), 0)
   lines.push(`session     ${s.misses.length} cold write${s.misses.length === 1 ? '' : 's'} paid, ${fmtUsd(paid)}`)
   return lines.join('\n')
@@ -445,7 +414,7 @@ function card(s: State, now: number): string {
 export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
-    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
     waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null,
     forkIsBehind: false, forkTouchedAt: 0,
   }
@@ -479,10 +448,8 @@ export const register: Register = on => {
     await prune($, s, now)
     const saved = await $.store.get(deadlineKey(s))
     const savedEvery = await $.store.get(everyKey(s))
-    const savedGuard = await $.store.get(KEY_GUARD)
     s.deadline = typeof saved === 'number' && saved > now ? saved : 0
     s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS && savedEvery < TTL_MS ? savedEvery : PING_AFTER_MS
-    s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
     // Always means a fresh default window every session, whatever the last one left behind.
     if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
@@ -496,20 +463,15 @@ export const register: Register = on => {
     })
     await $.command.register({
       name: 'cache-tax',
-      description: 'Prompt cache state, cold price and this session\'s cold writes; guard warn|refuse (cache-tax, the Mod)',
-      argumentHint: '[status | guard warn | guard refuse]',
+      description: 'Prompt cache state, cold price and this session\'s cold writes (cache-tax, the Mod)',
+      argumentHint: '[status]',
       immediate: true,
     })
-    // The hook form of cache-tax ships a /cache-tax:status skill; both installed means two guards.
-    const commands = await $.command.list()
-    if (commands.some(c => c.name === 'cache-tax:status')) {
-      $.ui.log('the hook form (cache-tax@claude-code-hooks) is also installed, so a cold send is warned about or refused twice. Uninstall it, or /cache-tax guard warn here.')
-    }
     updateStatus($, s, now)
     return r
   })
 
-  // Resume fields seed the guard before any turn of the resumed session has run.
+  // Resume fields seed the clock and the context before any turn of the resumed session has run.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
     // A resumed or cleared conversation is not the one a ping in flight was sent for.
@@ -526,10 +488,9 @@ export const register: Register = on => {
       else updateStatus($, s, await $.clock.now())
       return r
     }
-    const line = seedFromResume(s, e, await $.clock.now())
-    // The resume payload may omit the model; without it the guard cannot price the cold write.
+    seedFromResume(s, e, await $.clock.now())
+    // The resume payload may omit the model; without it the card cannot price the cold write.
     if (!s.lastModel) s.lastModel = await $.session.model()
-    if (line) $.ui.log(line)
     // The seeded clock decides whether a restored or always window pings before the first turn: never when it is cold.
     await arm($, s)
     return r
@@ -573,38 +534,14 @@ export const register: Register = on => {
     return { text: statusText(s, now) ?? 'keepwarm is off' }
   })
 
-  on('command.run', { command: 'cache-tax' }, async ($, e) => {
-    const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
-    const now = await $.clock.now()
-    if (words[0] === 'guard') {
-      if (words[1] !== 'warn' && words[1] !== 'refuse') return { text: '/cache-tax guard takes warn or refuse' }
-      s.guard = words[1]
-      await $.store.set(KEY_GUARD, s.guard)
-      return { text: s.guard === 'refuse' ? 'guard set to refuse once: a cold send is dropped with its price, the resend goes through' : 'guard set to warn: a cold send goes through with its price shown' }
-    }
-    return { text: card(s, now) }
-  })
+  on('command.run', { command: 'cache-tax' }, async $ => ({ text: card(s, await $.clock.now()) }))
 
   // The message that pays. Only its first character is read.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin') return next(e)
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
-    const now = await $.clock.now()
-    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
-    // A refused prompt that no person sent would be lost: nobody is there to send it again.
-    const unattended = UNATTENDED.has(e.origin.kind)
-    if (s.guard === 'warn' || unattended) {
-      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(holdMs(s))} once it lands.`)
-      s.coldWritePending = true
-      return next(e)
-    }
-    if (s.ackedAt === s.lastRequestAt) {
-      s.ackedAt = 0
-      s.coldWritePending = true
-      return next(e)
-    }
-    s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
+    if (isCold(s, await $.clock.now()) && s.ctx >= BIG_TOKENS) s.coldWritePending = true
+    return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -650,7 +587,6 @@ export const register: Register = on => {
     if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
     s.waitForTurn = false
-    s.ackedAt = 0
     // Always covers any break up to six hours after a turn that reached the cache (a turn that failed before any
     // response touched nothing, and its cache may be cold): a window of at least six hours at the default period,
     // which brings back a stopped window and replaces a shorter one or a testing period. Another session's
@@ -692,7 +628,6 @@ export const register: Register = on => {
     if (!e.agentId) {
       s.compacted = true
       s.ctx = 0
-      s.ackedAt = 0
       s.forkTouchedAt = 0
       outdate(s)
       disarm(s)
